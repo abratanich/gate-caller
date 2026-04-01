@@ -237,6 +237,27 @@ def call_gate(ser: serial.Serial) -> bool:
 # Глобальная ссылка на serial, устанавливается в main()
 _serial_lock = threading.Lock()
 _serial_ref = None
+_call_queue = []  # очередь звонков [(target, duration), ...]
+_queue_lock = threading.Lock()
+
+
+def _call_worker():
+    """Воркер — берёт звонки из очереди и выполняет последовательно."""
+    while True:
+        task = None
+        with _queue_lock:
+            if _call_queue:
+                task = _call_queue.pop(0)
+
+        if task:
+            target, duration = task
+            log.info(f"Queue: calling {target} ({duration}s), {len(_call_queue)} remaining")
+            with _serial_lock:
+                call_number(_serial_ref, target, duration)
+            # Пауза между звонками — модем должен освободиться
+            time.sleep(2)
+        else:
+            time.sleep(0.5)
 
 
 class APIHandler(BaseHTTPRequestHandler):
@@ -244,6 +265,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
     POST /call  {"target": "+380986015838", "duration": 20}
     GET  /health
+    GET  /queue
     """
 
     def log_message(self, format, *args):
@@ -251,7 +273,9 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            self._respond(200, {"status": "ok", "modem": MODEM_PORT})
+            self._respond(200, {"status": "ok", "modem": MODEM_PORT, "queue": len(_call_queue)})
+        elif self.path == "/queue":
+            self._respond(200, {"queue": list(_call_queue), "length": len(_call_queue)})
         else:
             self._respond(404, {"error": "not found"})
 
@@ -274,19 +298,12 @@ class APIHandler(BaseHTTPRequestHandler):
             self._respond(400, {"error": "target number required"})
             return
 
-        log.info(f"API call request: {target} ({duration}s)")
+        with _queue_lock:
+            position = len(_call_queue) + 1
+            _call_queue.append((target, duration))
 
-        # Звоним в отдельном потоке чтобы HTTP ответил сразу
-        def do_call():
-            with _serial_lock:
-                call_number(_serial_ref, target, duration)
-
-        if _serial_lock.locked():
-            self._respond(409, {"error": "modem busy, try later"})
-            return
-
-        threading.Thread(target=do_call, daemon=True).start()
-        self._respond(200, {"status": "calling", "target": target, "duration": duration})
+        log.info(f"API: queued call to {target} ({duration}s), position #{position}")
+        self._respond(200, {"status": "queued", "target": target, "duration": duration, "position": position})
 
     def _respond(self, code, data):
         self.send_response(code)
@@ -438,6 +455,12 @@ def main():
     global _serial_ref
     _serial_ref = ser
 
+    # Call queue worker
+    worker = threading.Thread(target=_call_worker, daemon=True)
+    worker.start()
+    log.info("Call queue worker started")
+
+    # HTTP API server
     api_server = HTTPServer(("0.0.0.0", API_PORT), APIHandler)
     api_thread = threading.Thread(target=api_server.serve_forever, daemon=True)
     api_thread.start()
