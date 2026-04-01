@@ -123,18 +123,18 @@ def mqtt_connect():
         return
 
     try:
-        _mqtt_client = mqtt.Client(client_id="gate_caller")
+        _mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="gate_caller")
         if MQTT_USER:
             _mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
 
-        def on_connect(client, userdata, flags, rc):
-            if rc == 0:
+        def on_connect(client, userdata, flags, rc, properties=None):
+            if rc == 0 or rc.value == 0:
                 log.info(f"MQTT connected to {MQTT_HOST}:{MQTT_PORT}")
                 _ha_discovery()
             else:
                 log.warning(f"MQTT connect failed: rc={rc}")
 
-        def on_disconnect(client, userdata, rc):
+        def on_disconnect(client, userdata, flags, rc, properties=None):
             log.warning(f"MQTT disconnected (rc={rc}), will reconnect...")
 
         _mqtt_client.on_connect = on_connect
