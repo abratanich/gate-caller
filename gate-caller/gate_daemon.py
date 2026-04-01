@@ -59,21 +59,30 @@ logging.basicConfig(
 log = logging.getLogger("gate-daemon")
 
 
+_ha_notify_enabled = True  # отключится при первом 401
+
+
 def notify_ha(event: str, data: dict = None):
     """Отправить событие в Home Assistant."""
-    if not HA_WEBHOOK_URL:
+    global _ha_notify_enabled
+    if not HA_WEBHOOK_URL or not HA_TOKEN or not _ha_notify_enabled:
         return
     try:
         payload = {"event": event, "timestamp": datetime.now().isoformat()}
         if data:
             payload.update(data)
-        headers = {}
-        if HA_TOKEN:
-            headers["Authorization"] = f"Bearer {HA_TOKEN}"
-        requests.post(HA_WEBHOOK_URL, json=payload, headers=headers, timeout=5)
-        log.info(f"HA notified: {event}")
-    except Exception as e:
-        log.warning(f"HA notify failed: {e}")
+        resp = requests.post(
+            HA_WEBHOOK_URL, json=payload,
+            headers={"Authorization": f"Bearer {HA_TOKEN}"},
+            timeout=5,
+        )
+        if resp.status_code == 401:
+            log.warning("HA API returned 401 — disabling event notifications (not critical)")
+            _ha_notify_enabled = False
+            return
+        log.info(f"HA event: {event}")
+    except Exception:
+        pass
 
 
 def send_at(ser: serial.Serial, command: str, timeout: float = 2.0) -> str:
