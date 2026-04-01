@@ -25,6 +25,13 @@ import requests
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
+from collections import deque
+
+try:
+    import paho.mqtt.client as mqtt
+    MQTT_AVAILABLE = True
+except ImportError:
+    MQTT_AVAILABLE = False
 
 # === Конфигурация ===
 MODEM_PORT = os.environ.get("MODEM_PORT", "/dev/ttyUSB0")
@@ -45,6 +52,13 @@ POST_HANGUP_DELAY = int(os.environ.get("POST_HANGUP_DELAY", "3"))
 # HTTP API port (для вызовов из HA автоматизаций)
 API_PORT = int(os.environ.get("API_PORT", "8099"))
 
+# MQTT
+MQTT_HOST = os.environ.get("MQTT_HOST", "core-mosquitto")
+MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
+MQTT_USER = os.environ.get("MQTT_USER", "")
+MQTT_PASS = os.environ.get("MQTT_PASS", "")
+MQTT_TOPIC = "gate_caller"
+
 # Home Assistant webhook (опционально)
 HA_WEBHOOK_URL = os.environ.get("HA_WEBHOOK_URL", "")
 HA_TOKEN = os.environ.get("HA_TOKEN", "")
@@ -59,30 +73,211 @@ logging.basicConfig(
 log = logging.getLogger("gate-daemon")
 
 
-_ha_notify_enabled = True  # отключится при первом 401
+# === Call Log ===
+MAX_LOG_ENTRIES = 50
+_call_log = deque(maxlen=MAX_LOG_ENTRIES)
 
 
-def notify_ha(event: str, data: dict = None):
-    """Отправить событие в Home Assistant."""
-    global _ha_notify_enabled
-    if not HA_WEBHOOK_URL or not HA_TOKEN or not _ha_notify_enabled:
+def log_call(event: str, caller: str = "", target: str = "", result: str = ""):
+    """Записать событие в лог звонков."""
+    entry = {
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "event": event,
+        "caller": caller,
+        "target": target,
+        "result": result,
+    }
+    _call_log.appendleft(entry)
+    return entry
+
+
+# === MQTT ===
+_mqtt_client = None
+
+
+def mqtt_connect():
+    """Подключиться к MQTT и зарегистрировать HA Discovery сенсоры."""
+    global _mqtt_client
+    if not MQTT_AVAILABLE:
+        log.warning("paho-mqtt not installed — MQTT disabled")
         return
+    if not MQTT_HOST:
+        return
+
     try:
-        payload = {"event": event, "timestamp": datetime.now().isoformat()}
-        if data:
-            payload.update(data)
-        resp = requests.post(
-            HA_WEBHOOK_URL, json=payload,
-            headers={"Authorization": f"Bearer {HA_TOKEN}"},
-            timeout=5,
-        )
-        if resp.status_code == 401:
-            log.warning("HA API returned 401 — disabling event notifications (not critical)")
-            _ha_notify_enabled = False
-            return
-        log.info(f"HA event: {event}")
-    except Exception:
-        pass
+        _mqtt_client = mqtt.Client(client_id="gate_caller")
+        if MQTT_USER:
+            _mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
+
+        def on_connect(client, userdata, flags, rc):
+            if rc == 0:
+                log.info(f"MQTT connected to {MQTT_HOST}:{MQTT_PORT}")
+                _ha_discovery()
+            else:
+                log.warning(f"MQTT connect failed: rc={rc}")
+
+        def on_disconnect(client, userdata, rc):
+            log.warning(f"MQTT disconnected (rc={rc}), will reconnect...")
+
+        _mqtt_client.on_connect = on_connect
+        _mqtt_client.on_disconnect = on_disconnect
+        _mqtt_client.reconnect_delay_set(min_delay=5, max_delay=60)
+        _mqtt_client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=60)
+        _mqtt_client.loop_start()
+    except Exception as e:
+        log.warning(f"MQTT init failed: {e}")
+        _mqtt_client = None
+
+
+def _ha_discovery():
+    """Регистрация сенсоров через HA MQTT Discovery."""
+    if not _mqtt_client:
+        return
+
+    device = {
+        "identifiers": ["gate_caller"],
+        "name": "Gate Caller",
+        "model": "GSM Modem Gate Opener",
+        "manufacturer": "gate-caller",
+    }
+
+    # Sensor: последний звонок
+    _mqtt_client.publish(
+        "homeassistant/sensor/gate_caller/last_call/config",
+        json.dumps({
+            "name": "Gate Last Call",
+            "unique_id": "gate_caller_last_call",
+            "state_topic": f"{MQTT_TOPIC}/last_call",
+            "value_template": "{{ value_json.event }}",
+            "json_attributes_topic": f"{MQTT_TOPIC}/last_call",
+            "icon": "mdi:phone-incoming",
+            "device": device,
+        }),
+        retain=True,
+    )
+
+    # Sensor: статус модема
+    _mqtt_client.publish(
+        "homeassistant/sensor/gate_caller/modem_status/config",
+        json.dumps({
+            "name": "Gate Modem Status",
+            "unique_id": "gate_caller_modem_status",
+            "state_topic": f"{MQTT_TOPIC}/status",
+            "value_template": "{{ value_json.state }}",
+            "json_attributes_topic": f"{MQTT_TOPIC}/status",
+            "icon": "mdi:cellphone-wireless",
+            "device": device,
+        }),
+        retain=True,
+    )
+
+    # Sensor: счётчик открытий сегодня
+    _mqtt_client.publish(
+        "homeassistant/sensor/gate_caller/opens_today/config",
+        json.dumps({
+            "name": "Gate Opens Today",
+            "unique_id": "gate_caller_opens_today",
+            "state_topic": f"{MQTT_TOPIC}/opens_today",
+            "icon": "mdi:gate-open",
+            "device": device,
+        }),
+        retain=True,
+    )
+
+    # Binary sensor: ворота открываются прямо сейчас
+    _mqtt_client.publish(
+        "homeassistant/binary_sensor/gate_caller/calling/config",
+        json.dumps({
+            "name": "Gate Calling",
+            "unique_id": "gate_caller_calling",
+            "state_topic": f"{MQTT_TOPIC}/calling",
+            "payload_on": "ON",
+            "payload_off": "OFF",
+            "device_class": "opening",
+            "icon": "mdi:gate",
+            "device": device,
+        }),
+        retain=True,
+    )
+
+    log.info("MQTT HA Discovery published")
+
+
+_opens_today = 0
+_opens_today_date = ""
+
+
+def mqtt_publish(event: str, data: dict = None):
+    """Опубликовать событие в MQTT."""
+    global _opens_today, _opens_today_date
+    if not _mqtt_client:
+        return
+
+    payload = {"event": event, "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    if data:
+        payload.update(data)
+
+    try:
+        # Последний звонок
+        _mqtt_client.publish(f"{MQTT_TOPIC}/last_call", json.dumps(payload), retain=True)
+
+        # Счётчик открытий
+        today = datetime.now().strftime("%Y-%m-%d")
+        if today != _opens_today_date:
+            _opens_today = 0
+            _opens_today_date = today
+        if event == "gate_opened":
+            _opens_today += 1
+        _mqtt_client.publish(f"{MQTT_TOPIC}/opens_today", str(_opens_today), retain=True)
+
+        # Calling binary sensor
+        if event == "gate_calling":
+            _mqtt_client.publish(f"{MQTT_TOPIC}/calling", "ON", retain=True)
+        elif event in ("gate_opened", "call_completed", "call_failed"):
+            _mqtt_client.publish(f"{MQTT_TOPIC}/calling", "OFF", retain=True)
+
+        # Статус модема
+        if event == "daemon_started":
+            _mqtt_client.publish(f"{MQTT_TOPIC}/status", json.dumps({"state": "online", "modem": MODEM_PORT}), retain=True)
+        elif event == "modem_error":
+            _mqtt_client.publish(f"{MQTT_TOPIC}/status", json.dumps({"state": "error", **payload}), retain=True)
+        elif event == "modem_reconnected":
+            _mqtt_client.publish(f"{MQTT_TOPIC}/status", json.dumps({"state": "online", "modem": MODEM_PORT}), retain=True)
+
+    except Exception as e:
+        log.debug(f"MQTT publish error: {e}")
+
+
+_ha_notify_enabled = True
+
+
+def notify(event: str, data: dict = None):
+    """Отправить событие во все каналы: MQTT + HA API + call log."""
+    # Call log
+    caller = (data or {}).get("caller", "")
+    target = (data or {}).get("number", (data or {}).get("target", ""))
+    log_call(event, caller=caller, target=target, result=event)
+
+    # MQTT
+    mqtt_publish(event, data)
+
+    # HA Supervisor API (может не работать без токена)
+    global _ha_notify_enabled
+    if HA_WEBHOOK_URL and HA_TOKEN and _ha_notify_enabled:
+        try:
+            payload = {"event": event, "timestamp": datetime.now().isoformat()}
+            if data:
+                payload.update(data)
+            resp = requests.post(
+                HA_WEBHOOK_URL, json=payload,
+                headers={"Authorization": f"Bearer {HA_TOKEN}"},
+                timeout=5,
+            )
+            if resp.status_code == 401:
+                log.info("HA Supervisor API auth unavailable — using MQTT instead")
+                _ha_notify_enabled = False
+        except Exception:
+            pass
 
 
 def send_at(ser: serial.Serial, command: str, timeout: float = 2.0) -> str:
@@ -212,13 +407,13 @@ def call_number(ser: serial.Serial, number: str, duration: int = None) -> bool:
     if duration is None:
         duration = GATE_RING_DURATION
     log.info(f"Calling: {number} (duration {duration}s)")
-    notify_ha("calling", {"number": number})
+    notify("calling", {"number": number})
 
     resp = send_at(ser, f"ATD{number};", timeout=10)
 
     if "ERROR" in resp:
         log.error(f"Call failed: {resp}")
-        notify_ha("call_failed", {"number": number, "error": resp})
+        notify("call_failed", {"number": number, "error": resp})
         return False
 
     log.info(f"Ringing for {duration}s...")
@@ -233,7 +428,7 @@ def call_number(ser: serial.Serial, number: str, duration: int = None) -> bool:
 
     hangup(ser)
     log.info(f"Call to {number} completed")
-    notify_ha("call_completed", {"number": number})
+    notify("call_completed", {"number": number})
     return True
 
 
@@ -282,9 +477,11 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            self._respond(200, {"status": "ok", "modem": MODEM_PORT, "queue": len(_call_queue)})
+            self._respond(200, {"status": "ok", "modem": MODEM_PORT, "queue": len(_call_queue), "mqtt": _mqtt_client is not None})
         elif self.path == "/queue":
             self._respond(200, {"queue": list(_call_queue), "length": len(_call_queue)})
+        elif self.path == "/log":
+            self._respond(200, {"log": list(_call_log), "total": len(_call_log)})
         else:
             self._respond(404, {"error": "not found"})
 
@@ -337,7 +534,7 @@ def check_modem_health(ser: serial.Serial) -> bool:
 def reconnect_modem(ser: serial.Serial) -> bool:
     """Переоткрыть порт и переинициализировать модем."""
     log.warning("Reconnecting modem...")
-    notify_ha("modem_reconnecting")
+    notify("modem_reconnecting")
     try:
         ser.close()
     except Exception:
@@ -347,7 +544,7 @@ def reconnect_modem(ser: serial.Serial) -> bool:
         ser.open()
         if init_modem(ser):
             log.info("Modem reconnected successfully")
-            notify_ha("modem_reconnected")
+            notify("modem_reconnected")
             return True
     except Exception as e:
         log.error(f"Reconnect failed: {e}")
@@ -381,7 +578,7 @@ def main_loop(ser: serial.Serial):
                             log.warning(f"Modem health check failed ({health_failures}/{MAX_HEALTH_FAILURES})")
                             if health_failures >= MAX_HEALTH_FAILURES:
                                 log.error("Modem unresponsive — restarting...")
-                                notify_ha("modem_error", {"error": "health check failed, restarting"})
+                                notify("modem_error", {"error": "health check failed, restarting"})
                                 if reconnect_modem(ser):
                                     health_failures = 0
                                 else:
@@ -409,7 +606,7 @@ def main_loop(ser: serial.Serial):
 
                         if is_allowed(caller):
                             log.info(f"Allowed caller: {caller} — opening gate!")
-                            notify_ha("call_received", {"caller": caller, "allowed": True})
+                            notify("call_received", {"caller": caller, "allowed": True})
 
                             with _serial_lock:
                                 hangup(ser)
@@ -419,7 +616,7 @@ def main_loop(ser: serial.Serial):
                         else:
                             log.warning(f"Rejected caller: {caller} — dropping call")
                             hangup(ser)
-                            notify_ha("call_rejected", {"caller": caller})
+                            notify("call_rejected", {"caller": caller})
 
                         ringing = False
                         caller = ""
@@ -437,7 +634,7 @@ def main_loop(ser: serial.Serial):
 
         except serial.SerialException as e:
             log.error(f"Serial error: {e}")
-            notify_ha("modem_error", {"error": str(e)})
+            notify("modem_error", {"error": str(e)})
             if not reconnect_modem(ser):
                 log.error("Cannot recover — exiting for supervisor restart")
                 sys.exit(1)
@@ -504,9 +701,11 @@ def main():
         log.error("Modem init failed")
         sys.exit(1)
 
-    # HTTP API сервер (замена notify.call)
     global _serial_ref
     _serial_ref = ser
+
+    # MQTT
+    mqtt_connect()
 
     # Call queue worker
     worker = threading.Thread(target=_call_worker, daemon=True)
@@ -518,10 +717,15 @@ def main():
     api_thread = threading.Thread(target=api_server.serve_forever, daemon=True)
     api_thread.start()
     log.info(f"HTTP API listening on port {API_PORT}")
-    log.info(f"  POST /call {{\"target\": \"+380...\", \"duration\": 20}}")
+    log.info(f"  POST /call  — make a call")
+    log.info(f"  GET  /log   — call history")
+    log.info(f"  GET  /health")
 
-    notify_ha("daemon_started")
+    notify("daemon_started")
     main_loop(ser)
+    if _mqtt_client:
+        _mqtt_client.publish(f"{MQTT_TOPIC}/status", json.dumps({"state": "offline"}), retain=True)
+        _mqtt_client.loop_stop()
     api_server.shutdown()
     ser.close()
 

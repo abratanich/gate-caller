@@ -1,6 +1,6 @@
 name: "Gate Caller"
 description: "GSM modem gate opener — incoming call + DTMF verification → outgoing call to open gate"
-version: "1.2.2"
+version: "2.0.0"
 slug: "gate_caller"
 url: "https://github.com/abratanich/gate-caller"
 arch:
@@ -33,6 +33,10 @@ options:
   gate_ring_duration: 20
   post_hangup_delay: 3
   api_port: 8099
+  mqtt_host: "core-mosquitto"
+  mqtt_port: 1883
+  mqtt_user: ""
+  mqtt_pass: ""
   log_level: "INFO"
 schema:
   modem_port: str
@@ -44,4 +48,8 @@ schema:
   gate_ring_duration: int
   post_hangup_delay: int
   api_port: int
+  mqtt_host: str
+  mqtt_port: int
+  mqtt_user: str
+  mqtt_pass: str
   log_level: "list(DEBUG|INFO|WARNING|ERROR)"

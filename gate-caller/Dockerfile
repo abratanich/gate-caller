@@ -3,7 +3,7 @@ FROM ${BUILD_FROM}
 
 # Python + зависимости
 RUN apk add --no-cache python3 py3-pip jq && \
-    pip3 install --no-cache-dir --break-system-packages pyserial requests
+    pip3 install --no-cache-dir --break-system-packages pyserial requests paho-mqtt
 
 # Копируем файлы
 COPY rootfs/ /
