@@ -1,0 +1,44 @@
+name: "Gate Caller"
+description: "GSM modem gate opener — incoming call + DTMF verification → outgoing call to open gate"
+version: "1.0.1"
+slug: "gate_caller"
+url: "https://github.com/ai-gld/gate-caller"
+arch:
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+  - i386
+startup: application
+boot: auto
+init: false
+hassio_api: true
+homeassistant_api: true
+uart: true
+usb: true
+devices:
+  - /dev/ttyUSB0
+  - /dev/ttyUSB1
+  - /dev/ttyUSB2
+  - /dev/ttyUSB3
+map:
+  - config:rw
+options:
+  modem_port: "/dev/ttyUSB0"
+  modem_baud: 115200
+  allowed_numbers: []
+  gate_number: ""
+  dtmf_timeout: 10
+  gate_ring_duration: 20
+  post_hangup_delay: 3
+  log_level: "INFO"
+schema:
+  modem_port: str
+  modem_baud: int
+  allowed_numbers:
+    - str
+  gate_number: str
+  dtmf_timeout: int
+  gate_ring_duration: int
+  post_hangup_delay: int
+  log_level: "list(DEBUG|INFO|WARNING|ERROR)"

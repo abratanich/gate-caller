@@ -1,0 +1,25 @@
+configuration:
+  modem_port:
+    name: Modem Port
+    description: Serial port of GSM modem (e.g. /dev/ttyUSB0)
+  modem_baud:
+    name: Baud Rate
+    description: Serial port baud rate
+  allowed_numbers:
+    name: Allowed Phone Numbers
+    description: List of phone numbers that can trigger gate opening (e.g. +380670000000)
+  gate_number:
+    name: Gate Phone Number
+    description: Phone number to call to open the gate (e.g. +380670000001)
+  dtmf_timeout:
+    name: DTMF Timeout
+    description: Seconds to wait for DTMF "1" confirmation after answering
+  gate_ring_duration:
+    name: Gate Ring Duration
+    description: Seconds to ring the gate number before hanging up
+  post_hangup_delay:
+    name: Post Hangup Delay
+    description: Seconds to wait after hanging up incoming call before dialing gate
+  log_level:
+    name: Log Level
+    description: Logging verbosity
