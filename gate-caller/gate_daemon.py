@@ -340,6 +340,26 @@ def main():
             baudrate=MODEM_BAUD,
             timeout=1,
             write_timeout=5,
+            dsrdtr=False,
+            rtscts=False,
+        )
+    except BrokenPipeError:
+        # Huawei modems fail on DTR — open without flow control
+        log.warning("DTR failed (Huawei modem), opening raw...")
+        import termios
+        import os as _os
+        fd = _os.open(MODEM_PORT, _os.O_RDWR | _os.O_NOCTTY | _os.O_NONBLOCK)
+        attrs = termios.tcgetattr(fd)
+        attrs[4] = attrs[5] = getattr(termios, f"B{MODEM_BAUD}")
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        _os.close(fd)
+        ser = serial.Serial(
+            port=MODEM_PORT,
+            baudrate=MODEM_BAUD,
+            timeout=1,
+            write_timeout=5,
+            dsrdtr=False,
+            rtscts=False,
         )
     except serial.SerialException as e:
         log.error(f"Cannot open {MODEM_PORT}: {e}")
