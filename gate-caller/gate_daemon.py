@@ -312,8 +312,41 @@ class APIHandler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(data).encode())
 
 
+HEALTH_CHECK_INTERVAL = 30  # секунд между проверками модема
+MAX_HEALTH_FAILURES = 3     # после N неудач — перезапуск
+
+
+def check_modem_health(ser: serial.Serial) -> bool:
+    """Проверить что модем отвечает на AT."""
+    try:
+        resp = send_at(ser, "AT", timeout=3)
+        return "OK" in resp
+    except Exception:
+        return False
+
+
+def reconnect_modem(ser: serial.Serial) -> bool:
+    """Переоткрыть порт и переинициализировать модем."""
+    log.warning("Reconnecting modem...")
+    notify_ha("modem_reconnecting")
+    try:
+        ser.close()
+    except Exception:
+        pass
+    time.sleep(3)
+    try:
+        ser.open()
+        if init_modem(ser):
+            log.info("Modem reconnected successfully")
+            notify_ha("modem_reconnected")
+            return True
+    except Exception as e:
+        log.error(f"Reconnect failed: {e}")
+    return False
+
+
 def main_loop(ser: serial.Serial):
-    """Основной цикл — слушаем входящие звонки."""
+    """Основной цикл — слушаем входящие звонки + health check."""
     log.info(f"Listening for calls on {MODEM_PORT}...")
     log.info(f"Allowed numbers: {ALLOWED_NUMBERS}")
     log.info(f"Gate number: {GATE_NUMBER}")
@@ -321,9 +354,31 @@ def main_loop(ser: serial.Serial):
     buffer = ""
     ringing = False
     caller = ""
+    last_health_check = time.time()
+    health_failures = 0
 
     while True:
         try:
+            # Периодическая проверка модема
+            now = time.time()
+            if now - last_health_check > HEALTH_CHECK_INTERVAL:
+                last_health_check = now
+                if not _serial_lock.locked():  # не проверять во время звонка
+                    with _serial_lock:
+                        if check_modem_health(ser):
+                            health_failures = 0
+                        else:
+                            health_failures += 1
+                            log.warning(f"Modem health check failed ({health_failures}/{MAX_HEALTH_FAILURES})")
+                            if health_failures >= MAX_HEALTH_FAILURES:
+                                log.error("Modem unresponsive — restarting...")
+                                notify_ha("modem_error", {"error": "health check failed, restarting"})
+                                if reconnect_modem(ser):
+                                    health_failures = 0
+                                else:
+                                    log.error("Reconnect failed — exiting for supervisor restart")
+                                    sys.exit(1)
+
             if ser.in_waiting:
                 chunk = ser.read(ser.in_waiting).decode("ascii", errors="replace")
                 buffer += chunk
@@ -348,14 +403,9 @@ def main_loop(ser: serial.Serial):
                             notify_ha("call_received", {"caller": caller, "allowed": True})
 
                             with _serial_lock:
-                                # Сбросить входящий звонок
                                 hangup(ser)
                                 log.info("Incoming call rejected (ATH)")
-
-                                # Пауза чтобы модем освободился
                                 time.sleep(POST_HANGUP_DELAY)
-
-                                # Звоним на ворота
                                 call_gate(ser)
                         else:
                             log.warning(f"Rejected caller: {caller}")
@@ -378,16 +428,9 @@ def main_loop(ser: serial.Serial):
         except serial.SerialException as e:
             log.error(f"Serial error: {e}")
             notify_ha("modem_error", {"error": str(e)})
-            time.sleep(5)
-            # Пробуем переоткрыть порт
-            try:
-                ser.close()
-                time.sleep(2)
-                ser.open()
-                init_modem(ser)
-            except Exception:
-                log.error("Failed to reopen serial port")
-                time.sleep(10)
+            if not reconnect_modem(ser):
+                log.error("Cannot recover — exiting for supervisor restart")
+                sys.exit(1)
 
         except KeyboardInterrupt:
             log.info("Shutting down...")
