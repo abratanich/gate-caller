@@ -254,10 +254,10 @@ def _call_worker():
             log.info(f"Queue: calling {target} ({duration}s), {len(_call_queue)} remaining")
             with _serial_lock:
                 call_number(_serial_ref, target, duration)
-            # Пауза между звонками — модем должен освободиться
-            time.sleep(2)
+            # Пауза между звонками
+            time.sleep(1)
         else:
-            time.sleep(0.5)
+            time.sleep(0.2)
 
 
 class APIHandler(BaseHTTPRequestHandler):
