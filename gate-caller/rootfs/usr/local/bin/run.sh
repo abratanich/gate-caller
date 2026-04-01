@@ -34,14 +34,16 @@ fi
 HA_WEBHOOK_URL="http://supervisor/core/api/events/gate_caller"
 HA_TOKEN="${SUPERVISOR_TOKEN:-}"
 
+API_PORT=$(jq -r '.api_port // 8099' "$CONFIG")
+
 export MODEM_PORT MODEM_BAUD ALLOWED_NUMBERS GATE_NUMBER
 export DTMF_TIMEOUT GATE_RING_DURATION POST_HANGUP_DELAY
-export HA_WEBHOOK_URL HA_TOKEN LOG_LEVEL
+export HA_WEBHOOK_URL HA_TOKEN LOG_LEVEL API_PORT
 
-echo "[INFO] Gate Caller starting..."
+echo "[INFO] Gate Caller v1.1.0 starting..."
 echo "[INFO] Modem: ${MODEM_PORT} @ ${MODEM_BAUD}"
 echo "[INFO] Allowed numbers: ${ALLOWED_NUMBERS}"
 echo "[INFO] Gate number: ${GATE_NUMBER}"
-echo "[INFO] DTMF timeout: ${DTMF_TIMEOUT}s"
+echo "[INFO] API port: ${API_PORT}"
 
 exec python3 /usr/local/bin/gate_daemon.py

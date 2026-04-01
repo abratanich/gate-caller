@@ -22,6 +22,8 @@ import sys
 import json
 import signal
 import requests
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 
 # === Конфигурация ===
@@ -39,6 +41,9 @@ GATE_NUMBER = os.environ.get("GATE_NUMBER", "")
 DTMF_TIMEOUT = int(os.environ.get("DTMF_TIMEOUT", "10"))
 GATE_RING_DURATION = int(os.environ.get("GATE_RING_DURATION", "20"))
 POST_HANGUP_DELAY = int(os.environ.get("POST_HANGUP_DELAY", "3"))
+
+# HTTP API port (для вызовов из HA автоматизаций)
+API_PORT = int(os.environ.get("API_PORT", "8099"))
 
 # Home Assistant webhook (опционально)
 HA_WEBHOOK_URL = os.environ.get("HA_WEBHOOK_URL", "")
@@ -193,34 +198,101 @@ def hangup(ser: serial.Serial):
     log.info("Hung up")
 
 
-def call_gate(ser: serial.Serial) -> bool:
-    """Позвонить на номер ворот для открытия."""
-    log.info(f"Calling gate: {GATE_NUMBER}")
-    notify_ha("gate_calling", {"number": GATE_NUMBER})
+def call_number(ser: serial.Serial, number: str, duration: int = None) -> bool:
+    """Позвонить на произвольный номер. Используется для ворот и как notify.call замена."""
+    if duration is None:
+        duration = GATE_RING_DURATION
+    log.info(f"Calling: {number} (duration {duration}s)")
+    notify_ha("calling", {"number": number})
 
-    # Инициируем голосовой вызов
-    resp = send_at(ser, f"ATD{GATE_NUMBER};", timeout=10)
+    resp = send_at(ser, f"ATD{number};", timeout=10)
 
     if "ERROR" in resp:
-        log.error(f"Gate call failed: {resp}")
-        notify_ha("gate_call_failed", {"error": resp})
+        log.error(f"Call failed: {resp}")
+        notify_ha("call_failed", {"number": number, "error": resp})
         return False
 
-    # Ждём пока ворота "услышат" звонок
-    log.info(f"Ringing gate for {GATE_RING_DURATION}s...")
-    end_time = time.time() + GATE_RING_DURATION
+    log.info(f"Ringing for {duration}s...")
+    end_time = time.time() + duration
     while time.time() < end_time:
         if ser.in_waiting:
             data = ser.read(ser.in_waiting).decode("ascii", errors="replace")
             if "NO CARRIER" in data or "BUSY" in data:
-                log.info("Gate answered/hung up — likely opened")
+                log.info("Remote side answered/hung up")
                 break
         time.sleep(1)
 
     hangup(ser)
-    log.info("Gate call completed")
-    notify_ha("gate_opened")
+    log.info(f"Call to {number} completed")
+    notify_ha("call_completed", {"number": number})
     return True
+
+
+def call_gate(ser: serial.Serial) -> bool:
+    """Позвонить на номер ворот."""
+    return call_number(ser, GATE_NUMBER)
+
+
+# === HTTP API — замена notify.call ===
+# Глобальная ссылка на serial, устанавливается в main()
+_serial_lock = threading.Lock()
+_serial_ref = None
+
+
+class APIHandler(BaseHTTPRequestHandler):
+    """HTTP API для вызовов из HA автоматизаций.
+
+    POST /call  {"target": "+380986015838", "duration": 20}
+    GET  /health
+    """
+
+    def log_message(self, format, *args):
+        log.debug(f"HTTP: {args[0]}")
+
+    def do_GET(self):
+        if self.path == "/health":
+            self._respond(200, {"status": "ok", "modem": MODEM_PORT})
+        else:
+            self._respond(404, {"error": "not found"})
+
+    def do_POST(self):
+        if self.path != "/call":
+            self._respond(404, {"error": "not found"})
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+        except (json.JSONDecodeError, ValueError):
+            self._respond(400, {"error": "invalid json"})
+            return
+
+        target = body.get("target", "")
+        duration = int(body.get("duration", GATE_RING_DURATION))
+
+        if not target:
+            self._respond(400, {"error": "target number required"})
+            return
+
+        log.info(f"API call request: {target} ({duration}s)")
+
+        # Звоним в отдельном потоке чтобы HTTP ответил сразу
+        def do_call():
+            with _serial_lock:
+                call_number(_serial_ref, target, duration)
+
+        if _serial_lock.locked():
+            self._respond(409, {"error": "modem busy, try later"})
+            return
+
+        threading.Thread(target=do_call, daemon=True).start()
+        self._respond(200, {"status": "calling", "target": target, "duration": duration})
+
+    def _respond(self, code, data):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
 
 
 def main_loop(ser: serial.Serial):
@@ -258,15 +330,16 @@ def main_loop(ser: serial.Serial):
                             log.info(f"Allowed caller: {caller} — opening gate!")
                             notify_ha("call_received", {"caller": caller, "allowed": True})
 
-                            # Сбросить входящий звонок
-                            hangup(ser)
-                            log.info("Incoming call rejected (ATH)")
+                            with _serial_lock:
+                                # Сбросить входящий звонок
+                                hangup(ser)
+                                log.info("Incoming call rejected (ATH)")
 
-                            # Пауза чтобы модем освободился
-                            time.sleep(POST_HANGUP_DELAY)
+                                # Пауза чтобы модем освободился
+                                time.sleep(POST_HANGUP_DELAY)
 
-                            # Звоним на ворота
-                            call_gate(ser)
+                                # Звоним на ворота
+                                call_gate(ser)
                         else:
                             log.warning(f"Rejected caller: {caller}")
                             notify_ha("call_rejected", {"caller": caller})
@@ -361,8 +434,19 @@ def main():
         log.error("Modem init failed")
         sys.exit(1)
 
+    # HTTP API сервер (замена notify.call)
+    global _serial_ref
+    _serial_ref = ser
+
+    api_server = HTTPServer(("0.0.0.0", API_PORT), APIHandler)
+    api_thread = threading.Thread(target=api_server.serve_forever, daemon=True)
+    api_thread.start()
+    log.info(f"HTTP API listening on port {API_PORT}")
+    log.info(f"  POST /call {{\"target\": \"+380...\", \"duration\": 20}}")
+
     notify_ha("daemon_started")
     main_loop(ser)
+    api_server.shutdown()
     ser.close()
 
 
