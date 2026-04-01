@@ -255,37 +255,26 @@ def main_loop(ser: serial.Serial):
                         log.info(f"Caller: {caller}")
 
                         if is_allowed(caller):
-                            log.info(f"Allowed caller: {caller} — answering")
+                            log.info(f"Allowed caller: {caller} — opening gate!")
                             notify_ha("call_received", {"caller": caller, "allowed": True})
 
-                            # Ответить
-                            if answer_call(ser):
-                                # Ждать DTMF "1"
-                                dtmf = wait_for_dtmf(ser, timeout=DTMF_TIMEOUT)
+                            # Сбросить входящий звонок
+                            hangup(ser)
+                            log.info("Incoming call rejected (ATH)")
 
-                                # Повесить входящий
-                                hangup(ser)
+                            # Пауза чтобы модем освободился
+                            time.sleep(POST_HANGUP_DELAY)
 
-                                if dtmf == "1":
-                                    log.info("DTMF 1 received — opening gate!")
-                                    # Пауза чтобы модем освободился
-                                    time.sleep(POST_HANGUP_DELAY)
-                                    # Звоним на ворота
-                                    call_gate(ser)
-                                else:
-                                    log.info(f"Wrong DTMF '{dtmf}' or timeout — not opening")
-                                    notify_ha("gate_denied", {"caller": caller, "dtmf": dtmf})
-                            else:
-                                log.warning("Failed to answer call")
+                            # Звоним на ворота
+                            call_gate(ser)
                         else:
                             log.warning(f"Rejected caller: {caller}")
                             notify_ha("call_rejected", {"caller": caller})
-                            # Не отвечаем — пусть звонит до timeout
 
                         ringing = False
                         caller = ""
 
-                    # Звонок завершён без ответа
+                    # Звонок завершён
                     if "NO CARRIER" in line:
                         ringing = False
                         caller = ""
