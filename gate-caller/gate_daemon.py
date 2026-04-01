@@ -37,9 +37,27 @@ except ImportError:
 MODEM_PORT = os.environ.get("MODEM_PORT", "/dev/ttyUSB0")
 MODEM_BAUD = int(os.environ.get("MODEM_BAUD", "115200"))
 
-# Разрешённые номера — задаются через UI аддона, не хардкодить!
-ALLOWED_NUMBERS = os.environ.get("ALLOWED_NUMBERS", "").split(",")
-ALLOWED_NUMBERS = [n.strip() for n in ALLOWED_NUMBERS if n.strip()]
+# Разрешённые номера — [{number, name}, ...] из JSON
+_raw_allowed = os.environ.get("ALLOWED_NUMBERS", "[]")
+try:
+    _allowed_list = json.loads(_raw_allowed)
+except json.JSONDecodeError:
+    # Fallback: comma-separated строка (старый формат)
+    _allowed_list = [{"number": n.strip(), "name": ""} for n in _raw_allowed.split(",") if n.strip()]
+
+# {normalized_number: name} для быстрого lookup
+ALLOWED_MAP = {}
+for entry in _allowed_list:
+    if isinstance(entry, dict):
+        num = entry.get("number", "")
+        name = entry.get("name", "")
+    else:
+        num = str(entry)
+        name = ""
+    if num:
+        ALLOWED_MAP[num] = name
+
+ALLOWED_NUMBERS = list(ALLOWED_MAP.keys())
 
 # Номер ворот — задаётся через UI аддона
 GATE_NUMBER = os.environ.get("GATE_NUMBER", "")
@@ -334,13 +352,18 @@ def normalize_number(number: str) -> str:
     return n
 
 
+def get_caller_name(caller: str) -> str:
+    """Получить имя звонящего. Пустая строка если не найден."""
+    caller_norm = normalize_number(caller)
+    for num, name in ALLOWED_MAP.items():
+        if normalize_number(num) == caller_norm:
+            return name or caller
+    return ""
+
+
 def is_allowed(caller: str) -> bool:
     """Проверить что номер в списке разрешённых."""
-    caller_norm = normalize_number(caller)
-    for allowed in ALLOWED_NUMBERS:
-        if normalize_number(allowed) == caller_norm:
-            return True
-    return False
+    return get_caller_name(caller) != ""
 
 
 def extract_caller(line: str) -> str:
@@ -605,8 +628,9 @@ def main_loop(ser: serial.Serial):
                         log.info(f"Caller: {caller}")
 
                         if is_allowed(caller):
-                            log.info(f"Allowed caller: {caller} — opening gate!")
-                            notify("call_received", {"caller": caller, "allowed": True})
+                            caller_name = get_caller_name(caller)
+                            log.info(f"Allowed: {caller_name} ({caller}) — opening gate!")
+                            notify("call_received", {"caller": caller, "caller_name": caller_name, "allowed": True})
 
                             with _serial_lock:
                                 hangup(ser)

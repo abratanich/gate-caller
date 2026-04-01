@@ -1,6 +1,6 @@
 name: "Gate Caller"
 description: "GSM modem gate opener — incoming call + DTMF verification → outgoing call to open gate"
-version: "2.0.0"
+version: "2.1.0"
 slug: "gate_caller"
 url: "https://github.com/abratanich/gate-caller"
 arch:
@@ -27,7 +27,9 @@ map:
 options:
   modem_port: "/dev/ttyUSB0"
   modem_baud: 115200
-  allowed_numbers: []
+  allowed_numbers:
+    - number: ""
+      name: ""
   gate_number: ""
   dtmf_timeout: 10
   gate_ring_duration: 20
@@ -42,7 +44,8 @@ schema:
   modem_port: str
   modem_baud: int
   allowed_numbers:
-    - str
+    - number: str
+      name: str
   gate_number: str
   dtmf_timeout: int
   gate_ring_duration: int
