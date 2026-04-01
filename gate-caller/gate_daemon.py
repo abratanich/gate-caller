@@ -417,7 +417,8 @@ def main_loop(ser: serial.Serial):
                                 time.sleep(POST_HANGUP_DELAY)
                                 call_gate(ser)
                         else:
-                            log.warning(f"Rejected caller: {caller}")
+                            log.warning(f"Rejected caller: {caller} — dropping call")
+                            hangup(ser)
                             notify_ha("call_rejected", {"caller": caller})
 
                         ringing = False

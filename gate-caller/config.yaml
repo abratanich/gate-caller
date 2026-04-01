@@ -1,6 +1,6 @@
 name: "Gate Caller"
 description: "GSM modem gate opener — incoming call + DTMF verification → outgoing call to open gate"
-version: "1.2.1"
+version: "1.2.2"
 slug: "gate_caller"
 url: "https://github.com/abratanich/gate-caller"
 arch:
