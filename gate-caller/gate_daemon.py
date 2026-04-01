@@ -335,6 +335,26 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
 
     try:
+        # Huawei USB modems throw BrokenPipeError on DTR ioctl.
+        # Workaround: patch Serial to skip DTR/RTS state updates.
+        _orig_update_dtr = serial.Serial._update_dtr_state
+        _orig_update_rts = serial.Serial._update_rts_state
+
+        def _noop_dtr(self):
+            try:
+                _orig_update_dtr(self)
+            except (BrokenPipeError, OSError):
+                pass
+
+        def _noop_rts(self):
+            try:
+                _orig_update_rts(self)
+            except (BrokenPipeError, OSError):
+                pass
+
+        serial.Serial._update_dtr_state = _noop_dtr
+        serial.Serial._update_rts_state = _noop_rts
+
         ser = serial.Serial(
             port=MODEM_PORT,
             baudrate=MODEM_BAUD,
@@ -343,24 +363,7 @@ def main():
             dsrdtr=False,
             rtscts=False,
         )
-    except BrokenPipeError:
-        # Huawei modems fail on DTR — open without flow control
-        log.warning("DTR failed (Huawei modem), opening raw...")
-        import termios
-        import os as _os
-        fd = _os.open(MODEM_PORT, _os.O_RDWR | _os.O_NOCTTY | _os.O_NONBLOCK)
-        attrs = termios.tcgetattr(fd)
-        attrs[4] = attrs[5] = getattr(termios, f"B{MODEM_BAUD}")
-        termios.tcsetattr(fd, termios.TCSANOW, attrs)
-        _os.close(fd)
-        ser = serial.Serial(
-            port=MODEM_PORT,
-            baudrate=MODEM_BAUD,
-            timeout=1,
-            write_timeout=5,
-            dsrdtr=False,
-            rtscts=False,
-        )
+        log.info(f"Serial port opened: {MODEM_PORT}")
     except serial.SerialException as e:
         log.error(f"Cannot open {MODEM_PORT}: {e}")
         sys.exit(1)
