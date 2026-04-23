@@ -189,14 +189,30 @@ def _ha_discovery():
         retain=True,
     )
 
-    # Sensor: счётчик открытий сегодня
+    # Sensor: счётчик открытий сегодня + атрибуты с историей
     _mqtt_client.publish(
         "homeassistant/sensor/gate_caller/opens_today/config",
         json.dumps({
             "name": "Gate Opens Today",
             "unique_id": "gate_caller_opens_today",
             "state_topic": f"{MQTT_TOPIC}/opens_today",
+            "json_attributes_topic": f"{MQTT_TOPIC}/opens_today/attrs",
             "icon": "mdi:gate-open",
+            "device": device,
+        }),
+        retain=True,
+    )
+
+    # Sensor: последний кто открыл ворота (state = имя, атрибуты = номер/время)
+    _mqtt_client.publish(
+        "homeassistant/sensor/gate_caller/last_opener/config",
+        json.dumps({
+            "name": "Gate Last Opener",
+            "unique_id": "gate_caller_last_opener",
+            "state_topic": f"{MQTT_TOPIC}/last_opener",
+            "value_template": "{{ value_json.name | default('—') }}",
+            "json_attributes_topic": f"{MQTT_TOPIC}/last_opener",
+            "icon": "mdi:account-check",
             "device": device,
         }),
         retain=True,
@@ -223,6 +239,7 @@ def _ha_discovery():
 
 _opens_today = 0
 _opens_today_date = ""
+_opens_today_log: deque = deque(maxlen=30)  # [{time, caller, name}] сегодняшние открытия
 
 
 def mqtt_publish(event: str, data: dict = None):
@@ -239,13 +256,33 @@ def mqtt_publish(event: str, data: dict = None):
         # Последний звонок
         _mqtt_client.publish(f"{MQTT_TOPIC}/last_call", json.dumps(payload), retain=True)
 
-        # Счётчик открытий
+        # Счётчик открытий + история за день
         today = datetime.now().strftime("%Y-%m-%d")
         if today != _opens_today_date:
             _opens_today = 0
             _opens_today_date = today
+            _opens_today_log.clear()
         if event == "gate_opened":
             _opens_today += 1
+            entry = {
+                "time": payload.get("time"),
+                "caller": payload.get("caller", ""),
+                "name": payload.get("caller_name") or payload.get("caller") or "unknown",
+            }
+            _opens_today_log.appendleft(entry)
+
+            # Атрибуты: список сегодняшних открытий для карточки "Активность"
+            attrs = {
+                "last_caller": entry["caller"],
+                "last_name": entry["name"],
+                "last_time": entry["time"],
+                "today": list(_opens_today_log),
+            }
+            _mqtt_client.publish(f"{MQTT_TOPIC}/opens_today/attrs", json.dumps(attrs), retain=True)
+
+            # Отдельный sensor: кто открыл последним
+            _mqtt_client.publish(f"{MQTT_TOPIC}/last_opener", json.dumps(entry), retain=True)
+
         _mqtt_client.publish(f"{MQTT_TOPIC}/opens_today", str(_opens_today), retain=True)
 
         # Calling binary sensor
@@ -455,9 +492,17 @@ def call_number(ser: serial.Serial, number: str, duration: int = None) -> bool:
     return True
 
 
-def call_gate(ser: serial.Serial) -> bool:
-    """Позвонить на номер ворот."""
-    return call_number(ser, GATE_NUMBER)
+def call_gate(ser: serial.Serial, caller: str = "", caller_name: str = "") -> bool:
+    """Позвонить на номер ворот. caller/caller_name записываются в "кто открыл"."""
+    ok = call_number(ser, GATE_NUMBER)
+    if ok:
+        # Ворота "открыты" = звонок прошёл. Именно здесь инкремент счётчика + история.
+        notify("gate_opened", {
+            "caller": caller,
+            "caller_name": caller_name,
+            "target": GATE_NUMBER,
+        })
+    return ok
 
 
 # === HTTP API — замена notify.call ===
@@ -477,10 +522,17 @@ def _call_worker():
                 task = _call_queue.pop(0)
 
         if task:
-            target, duration = task
+            target, duration, caller_name = task
             log.info(f"Queue: calling {target} ({duration}s), {len(_call_queue)} remaining")
             with _serial_lock:
-                call_number(_serial_ref, target, duration)
+                ok = call_number(_serial_ref, target, duration)
+            # Если этот звонок — открытие ворот, зафиксировать кто инициировал.
+            if ok and GATE_NUMBER and target == GATE_NUMBER:
+                notify("gate_opened", {
+                    "caller": caller_name or "api",
+                    "caller_name": caller_name or "HA API",
+                    "target": GATE_NUMBER,
+                })
             # Пауза между звонками
             time.sleep(1)
         else:
@@ -522,6 +574,8 @@ class APIHandler(BaseHTTPRequestHandler):
 
         target = body.get("target", "")
         duration = int(body.get("duration", GATE_RING_DURATION))
+        # HA automation may pass `caller_name` (e.g. triggering user or "Въезд button").
+        caller_name = str(body.get("caller_name", "")).strip()
 
         if not target:
             self._respond(400, {"error": "target number required"})
@@ -529,10 +583,10 @@ class APIHandler(BaseHTTPRequestHandler):
 
         with _queue_lock:
             position = len(_call_queue) + 1
-            _call_queue.append((target, duration))
+            _call_queue.append((target, duration, caller_name))
 
-        log.info(f"API: queued call to {target} ({duration}s), position #{position}")
-        self._respond(200, {"status": "queued", "target": target, "duration": duration, "position": position})
+        log.info(f"API: queued call to {target} ({duration}s), by='{caller_name or '-'}', position #{position}")
+        self._respond(200, {"status": "queued", "target": target, "duration": duration, "caller_name": caller_name, "position": position})
 
     def _respond(self, code, data):
         self.send_response(code)
@@ -636,7 +690,7 @@ def main_loop(ser: serial.Serial):
                                 hangup(ser)
                                 log.info("Incoming call rejected (ATH)")
                                 time.sleep(POST_HANGUP_DELAY)
-                                call_gate(ser)
+                                call_gate(ser, caller=caller, caller_name=caller_name)
                         else:
                             log.warning(f"Rejected caller: {caller} — dropping call")
                             hangup(ser)
